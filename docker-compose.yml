@@ -5,3 +5,8 @@ services:
     container_name: kudexmeta
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - kudexmeta_data:/app/data
+
+volumes:
+  kudexmeta_data:
