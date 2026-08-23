@@ -1,0 +1,7 @@
+services:
+  bot:
+    build: .
+    image: kudexmeta:latest
+    container_name: kudexmeta
+    restart: unless-stopped
+    env_file: .env
