@@ -20,6 +20,8 @@ from aiogram.filters import BaseFilter, Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -48,7 +50,8 @@ ADMIN_USERNAMES = {
 }
 
 START_TIME = time.time()
-VERSION = "1.2"
+VERSION = "1.3"
+OWNER = os.getenv("OWNER_USERNAME", "inhgalator").lstrip("@")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -942,8 +945,15 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 
 @dp.message(Command("admin"), IsAdmin())
-async def cmd_admin(message: Message, state: FSMContext) -> None:
+async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
+    try:
+        await bot.set_my_commands(
+            ADMIN_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=message.chat.id),
+        )
+    except Exception:
+        logging.exception("admin commands setup failed")
     await message.answer(ADMIN_HOME, reply_markup=admin_menu_kb())
 
 
@@ -1321,6 +1331,49 @@ async def on_unknown(message: Message) -> None:
     )
 
 
+BOT_DESCRIPTION = (
+    f"🔍 KudexMeta вскрывает твои файлы, как forensic-эксперт\n\n"
+    "Пришли фото или документ — и узнай:\n"
+    "📍 где это снято — точные координаты и карта\n"
+    "📱 каким устройством и когда\n"
+    "⚙️ ISO, выдержку, диафрагму\n"
+    "💻 в какой программе обработано\n\n"
+    "Потом одной кнопкой сотри все следы 🧹 и получи чистый файл без метаданных.\n\n"
+    "Поддержка: JPG · PNG · WEBP · HEIC · PDF · MP3/FLAC · DOCX/XLSX\n\n"
+    f"👤 Владелец: @{OWNER}"
+)
+
+BOT_SHORT_DESCRIPTION = (
+    "Вскрываю файлы: 📍GPS · 📱камера · 📅даты. "
+    "Чистка метаданных одной кнопкой 🧹 "
+    f"Владелец — @{OWNER}"
+)
+
+PUBLIC_COMMANDS = [
+    BotCommand(command="start", description="🏠 Главное меню"),
+    BotCommand(command="stats", description="📊 Моя статистика"),
+    BotCommand(command="settings", description="⚙️ Настройки"),
+    BotCommand(command="help", description="📖 Инструкция"),
+    BotCommand(command="cancel", description="❌ Отменить действие"),
+]
+
+ADMIN_COMMANDS = [
+    BotCommand(command="admin", description="🛠 Панель админа"),
+    BotCommand(command="stats", description="📊 Статистика бота"),
+    BotCommand(command="cancel", description="❌ Отменить действие"),
+]
+
+
+async def setup_profile(bot: Bot) -> None:
+    try:
+        await bot.set_my_description(BOT_DESCRIPTION)
+        await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
+        await bot.set_my_commands(PUBLIC_COMMANDS)
+        logging.info("bot profile configured")
+    except Exception:
+        logging.exception("profile setup failed")
+
+
 async def main() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
     load_admins()
@@ -1328,6 +1381,7 @@ async def main() -> None:
         pass
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=True)
+    await setup_profile(bot)
     await dp.start_polling(bot)
 
 
