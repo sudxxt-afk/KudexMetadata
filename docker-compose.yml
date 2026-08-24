@@ -5,6 +5,8 @@ services:
     container_name: kudexmeta
     restart: unless-stopped
     env_file: .env
+    mem_limit: 512m
+    mem_reservation: 128m
     volumes:
       - kudexmeta_data:/app/data
 
