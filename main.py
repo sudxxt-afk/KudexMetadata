@@ -29,14 +29,36 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
 )
-from PIL import Image
+from PIL import Image, ImageOps
 from PIL.ExifTags import GPSTAGS, TAGS
 from mutagen import File as MutagenFile
 from pypdf import PdfReader, PdfWriter
 
 pillow_heif.register_heif_opener()
 
+VERSION = "1.5"
+
+DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n)) % 100
+    if 11 <= n <= 14:
+        return many
+    d = n % 10
+    if d == 1:
+        return one
+    if 2 <= d <= 4:
+        return few
+    return many
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKENS = [
+    t.strip()
+    for t in os.getenv("BOT_TOKENS", "").replace("\n", ",").split(",")
+    if t.strip()
+] or ([BOT_TOKEN] if BOT_TOKEN else [])
+
 DB_DIR = os.getenv("DB_DIR", os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(DB_DIR, "kudexmeta.db")
 
@@ -50,16 +72,17 @@ ADMIN_USERNAMES = {
 }
 
 START_TIME = time.time()
-VERSION = "1.3"
 OWNER = os.getenv("OWNER_USERNAME", "inhgalator").lstrip("@")
 
-logging.basicConfig(level=logging.INFO)
-
-dp = Dispatcher()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 pending: dict[str, dict] = {}
 PENDING_TTL = 1800
-MAX_PENDING = 200
+MAX_PENDING = int(os.getenv("PENDING_MAX_FILES", "200"))
+PENDING_MAX_BYTES = int(os.getenv("PENDING_MAX_MB", "256")) * 1024 * 1024
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tiff")
 AUDIO_EXTS = (".mp3", ".flac", ".ogg", ".opus", ".m4a", ".wav", ".aac", ".wma")
@@ -76,33 +99,45 @@ def human_size(n: int) -> str:
     return f"{n / 1024:.0f} КБ"
 
 
+_conn: sqlite3.Connection | None = None
+
+
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            name TEXT,
-            username TEXT,
-            scanned INTEGER DEFAULT 0,
-            cleaned INTEGER DEFAULT 0,
-            gps_hits INTEGER DEFAULT 0,
-            send_as_doc INTEGER DEFAULT 1,
-            first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_seen TEXT DEFAULT CURRENT_TIMESTAMP)"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS banned(
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT,
-            banned_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS admins(
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
-    )
-    return conn
+    global _conn
+    if _conn is None:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS users(
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                username TEXT,
+                scanned INTEGER DEFAULT 0,
+                cleaned INTEGER DEFAULT 0,
+                gps_hits INTEGER DEFAULT 0,
+                send_as_doc INTEGER DEFAULT 1,
+                first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_seen TEXT DEFAULT CURRENT_TIMESTAMP)"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS banned(
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                banned_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS admins(
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_scanned ON users(scanned)")
+        _conn = conn
+    return _conn
 
 
 admin_cache: set[int] = set()
@@ -306,19 +341,36 @@ RISK_LABELS = {
 }
 
 
-def risk_block(level: int) -> str:
+def risk_block(level: int, total: int = 0) -> str:
     label, hint = RISK_LABELS[level]
-    filled = max(level, 1)
-    icon = "🔴" if level >= 4 else "🟡" if level >= 2 else "🟢"
-    bar = icon * filled + "⚪" * (5 - filled)
     if level == 0:
-        bar = "🟢🟢🟢🟢🟢"
+        return (
+            "✨ <b>ЧИСТО</b>\n"
+            "🟢🟢🟢🟢🟢\n"
+            "<i>Файл не выдаёт о тебе ни байта 🔒</i>"
+        )
+    filled = min(level, 5)
+    icon = "🔴" if level >= 5 else "🟠" if level == 4 else "🟡" if level == 3 else "🟢"
+    bar = icon * filled + "⚪" * (5 - filled)
+    counter = f"\n🧩 Скрытых полей: <b>{total}</b>" if total else ""
     return (
-        "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
-        f"<b>УРОВЕНЬ РИСКА:</b> {label}\n"
-        f"{bar}\n"
-        f"<i>{hint}</i>"
+        f"{bar}  <b>{label}</b>\n"
+        f"<i>{hint}</i>{counter}"
     )
+
+
+def fmt_exposure_line(exif: dict) -> str | None:
+    parts = []
+    iso = fmt_value("ISOSpeedRatings", exif.get("ISOSpeedRatings"))
+    if iso:
+        parts.append(f"ISO {iso}")
+    for tag in ("FNumber", "ExposureTime", "FocalLength"):
+        value = fmt_value(tag, exif.get(tag))
+        if value:
+            parts.append(value)
+    if not parts:
+        return None
+    return " · ".join(parts)
 
 
 def format_value_tag(tag: str, value):
@@ -346,22 +398,25 @@ def build_details(exif: dict) -> str | None:
 
 
 def strip_image(data: bytes):
-    image = Image.open(io.BytesIO(data))
-    clean = Image.new(image.mode, image.size)
-    clean.putdata(list(image.getdata()))
-    buf = io.BytesIO()
-    fmt = (image.format or "JPEG").upper()
-    if fmt in ("JPEG", "MPO"):
-        clean.save(buf, "JPEG", quality=95, subsampling=0)
+    with Image.open(io.BytesIO(data)) as image:
+        fmt = (image.format or "JPEG").upper()
+        image.load()
+        try:
+            image = ImageOps.exif_transpose(image)
+        except Exception:
+            pass
+        buf = io.BytesIO()
+        if fmt in ("JPEG", "MPO"):
+            image.save(buf, "JPEG", quality=95, subsampling=0)
+            return buf.getvalue(), "cleaned.jpg"
+        if fmt == "PNG":
+            image.save(buf, "PNG", optimize=True)
+            return buf.getvalue(), "cleaned.png"
+        if fmt == "WEBP":
+            image.save(buf, "WEBP", quality=95)
+            return buf.getvalue(), "cleaned.webp"
+        image.convert("RGB").save(buf, "JPEG", quality=95)
         return buf.getvalue(), "cleaned.jpg"
-    if fmt == "PNG":
-        clean.save(buf, "PNG", optimize=True)
-        return buf.getvalue(), "cleaned.png"
-    if fmt == "WEBP":
-        clean.save(buf, "WEBP", quality=95)
-        return buf.getvalue(), "cleaned.webp"
-    clean.convert("RGB").save(buf, "JPEG", quality=95)
-    return buf.getvalue(), "cleaned.jpg"
 
 
 def analyze_pdf(data: bytes):
@@ -380,17 +435,23 @@ def analyze_pdf(data: bytes):
         ("🔄", "Изменён", meta.get("/ModDate")),
     ]
     rows = [f"{icon} <b>{title}:</b> {esc(v)}" for icon, title, v in fields if v]
-    total = sum(1 for _, _, v in fields if v) + 3
+    found = sum(1 for _, _, v in fields if v)
+    total = found + 3
 
     text = [
         "📕 <b>PDF-документ</b>",
-        f"📄 Страниц: <b>{pages}</b>",
+        f"📑 {pages} {plural(pages, 'страница', 'страницы', 'страниц')}"
+        + (f" · 🧩 найдено полей: <b>{found}</b>" if found else ""),
     ]
     if rows:
-        text.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
+        text.append(DIVIDER)
         text.extend(rows[:7])
-    text.append("")
-    text.append(risk_block(min(4, 2 + (1 if rows else 0))))
+    text.append(DIVIDER)
+    if rows:
+        text.append("⚠️ Внутри найдены <b>личные данные автора</b>")
+    else:
+        text.append("✅ Скрытых данных не найдено")
+    text.append(risk_block(min(4, 2 + (1 if rows else 0)), total))
     summary = {"total": total}
     return "\n".join(text), summary
 
@@ -448,12 +509,13 @@ def analyze_office(data: bytes, name: str):
 
     text = [
         f"{icon} <b>Документ Office</b>",
-        f"📄 {esc(name)}",
+        f"📄 {esc(name)}"
+        + (f" · 🧩 найдено полей: <b>{len(rows)}</b>" if rows else ""),
     ]
     if rows:
-        text.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
+        text.append(DIVIDER)
         text.extend(rows[:8])
-    text.append("")
+    text.append(DIVIDER)
     if rows:
         text.append("⚠️ Внутри документа найдены <b>личные данные автора</b>")
     else:
@@ -469,13 +531,16 @@ def analyze_audio(data: bytes, name: str):
     if audio is None:
         return None
     info = audio.info
-    rows = []
+    chips = []
     duration = getattr(info, "length", 0)
     mins, secs = divmod(int(duration), 60)
-    rows.append(f"⏱ <b>Длительность:</b> {mins}:{secs:02d}")
+    if duration:
+        chips.append(f"⏱ {mins}:{secs:02d}")
     bitrate = getattr(info, "bitrate", 0)
     if bitrate:
-        rows.append(f"🎚 <b>Битрейт:</b> {bitrate // 1000} кбит/с")
+        chips.append(f"🎚 {bitrate // 1000} кбит/с")
+
+    tag_rows = []
 
     tags_map = [
         ("title", "🎵", "Название"), ("TIT2", "🎵", "Название"), ("\xa9nam", "🎵", "Название"),
@@ -493,21 +558,23 @@ def analyze_audio(data: bytes, name: str):
                 val = tags[key]
                 if isinstance(val, list):
                     val = val[0]
-                rows.append(f"{ic} <b>{title}:</b> {esc(str(val)[:60])}")
+                tag_rows.append(f"{ic} <b>{title}:</b> {esc(str(val)[:60])}")
                 seen.add(key)
 
     text = [
-        f"🎧 <b>Аудиофайл</b>",
-        f"📄 {esc(name)}",
-        "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈",
-        *rows[:8],
-        "",
+        "🎧 <b>Аудиофайл</b>",
+        f"🎵 {esc(name)}",
     ]
-    has_tags = bool(seen)
-    if has_tags:
-        text.append("⚠️ Найдены теги с личными данными")
+    if chips:
+        text.append(" · ".join(chips))
+    if tag_rows:
+        text.append(DIVIDER)
+        text.extend(tag_rows[:8])
+        verdict = f"⚠️ Найдено тегов: <b>{len(tag_rows)}</b> — есть личные данные"
     else:
-        text.append("✅ Теги не обнаружены")
+        verdict = "✅ Теги не обнаружены"
+    text.append(DIVIDER)
+    text.append(verdict)
     return "\n".join(text), bool(audio.tags)
 
 
@@ -528,33 +595,40 @@ def build_report(image: Image.Image, size: int, name: str | None):
     exif = get_exif(image)
     coords = gps_to_decimal(exif["GPSInfo"]) if isinstance(exif.get("GPSInfo"), dict) else None
     level = risk_level(exif, coords)
+    total = count_fields(exif)
 
     display_name = name or f"photo.{(image.format or 'img').lower()}"
     lines = [
         f"📄 <b>{esc(display_name)}</b>",
-        f"🖼 {image.width} × {image.height} · {esc(image.format or '?')} · {human_size(size)}",
+        f"🖼 {image.width} × {image.height} · {esc(image.format or '?')} · {human_size(size)}"
+        + (f" · 🧩 {total}" if total else ""),
     ]
 
-    info_rows = []
-    for tag, icon, title in EXIF_FIELDS:
+    identity_rows = []
+    for tag, icon, title in EXIF_FIELDS[:5]:
         value = fmt_value(tag, exif.get(tag))
         if value:
-            info_rows.append(f"{icon} <b>{title}:</b> {esc(value)}")
+            identity_rows.append(f"{icon} <b>{title}:</b> {esc(value)}")
 
-    if info_rows:
-        lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
-        lines.extend(info_rows[:6])
+    exposure = fmt_exposure_line(exif)
+
+    if identity_rows:
+        lines.append(DIVIDER)
+        lines.extend(identity_rows[:5])
+    if exposure:
+        lines.append(f"⚙️ <i>{esc(exposure)}</i>")
 
     if coords:
         lat, lon = coords
-        lines.append("┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
-        lines.append(f"📍 <b>ГЕОЛОКАЦИЯ:</b> {lat:.5f}, {lon:.5f}")
+        lines.append(DIVIDER)
+        lines.append("📍 <b>GEO-МЕТКА НАЙДЕНА</b>")
+        lines.append(f"<code>{lat:.5f}, {lon:.5f}</code>")
 
-    lines.append("")
-    lines.append(risk_block(level))
+    lines.append(DIVIDER)
+    lines.append(risk_block(level, total))
 
     summary = {
-        "total": count_fields(exif),
+        "total": total,
         "has_gps": coords is not None,
         "has_camera": bool(fmt_value("Model", exif.get("Model"))),
         "has_details": build_details(exif) is not None,
@@ -578,8 +652,10 @@ def prune_pending() -> None:
     stale = [k for k, v in pending.items() if now - v["ts"] > PENDING_TTL]
     for k in stale:
         pending.pop(k, None)
-    while len(pending) > MAX_PENDING:
-        pending.pop(next(iter(pending)))
+    total = sum(len(v["data"]) for v in pending.values())
+    while pending and (len(pending) > MAX_PENDING or total > PENDING_MAX_BYTES):
+        k = next(iter(pending))
+        total -= len(pending.pop(k)["data"])
 
 
 SHARE_TEXT = "Узнаю всё о твоих фото и стираю метаданные 🧹"
@@ -639,7 +715,7 @@ ABOUT_TEXT = (
     "🔒 <b>Приватность:</b> файлы не сохраняются на сервере — только в памяти на время обработки\n"
     "⚡ <b>Стек:</b> Python · aiogram · Pillow\n"
     "🧹 <b>Очистка:</b> EXIF, GPS, PDF-мета, аудио-теги\n\n"
-    "Версия 1.1 · сделано с ❤️"
+    f"Версия {VERSION} · сделано с ❤️"
 )
 
 LEVELS = [
@@ -648,6 +724,78 @@ LEVELS = [
     (5, "🎭 Скрытный"),
     (0, "🐣 Новичок"),
 ]
+
+
+def analyze_sync(key: str, data: bytes, mime: str, lower_name: str, source_name: str | None, is_photo: bool) -> dict:
+    res = {"kind": "unknown", "text": None, "markup": None, "store": False, "bump_gps": False, "unsupported": False}
+
+    if is_photo or mime.startswith("image/") or lower_name.endswith(IMAGE_EXTS):
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        res["kind"] = "image"
+        report, summary, coords = build_report(image, len(data), source_name)
+        note = ""
+        if is_photo:
+            note = "\n\n<i>⚠️ Telegram уже сжал это фото и стёр часть данных.\nОтправь файлом (📎) — увижу настоящий EXIF</i>"
+        res["text"] = report + note
+        res["markup"] = build_markup(key, coords, summary["has_details"])
+        res["store"] = True
+        res["bump_gps"] = bool(coords)
+        return res
+
+    if mime == "application/pdf" or lower_name.endswith(".pdf"):
+        report, _ = analyze_pdf(data)
+        res["kind"] = "pdf"
+        res["text"] = report
+        res["markup"] = build_markup(key, None, False, kind="pdf")
+        res["store"] = True
+        return res
+
+    if lower_name.endswith(OFFICE_EXTS):
+        report = analyze_office(data, source_name or "document")
+        res["text"] = report + "\n\n<i>🧹 Очистка документов скоро…</i>"
+        return res
+
+    if mime.startswith("audio/") or lower_name.endswith(AUDIO_EXTS):
+        result = analyze_audio(data, source_name or "audio")
+        if result is None:
+            size_line = f"📄 <b>{esc(source_name)}</b>\n💾 {human_size(len(data))}\n🏷 MIME: {esc(mime or 'неизвестно')}"
+            res["text"] = size_line + "\n\n🤷 Не смог разобрать теги этого аудио."
+            return res
+        report, _has_tags = result
+        res["kind"] = "audio"
+        res["text"] = report
+        res["markup"] = build_markup(key, None, False, kind="audio")
+        res["store"] = True
+        return res
+
+    res["unsupported"] = True
+    return res
+
+
+def clean_sync(kind: str, data: bytes, name: str | None):
+    removed_lines = []
+    if kind == "image":
+        exif = get_exif(Image.open(io.BytesIO(data)))
+        n_fields = count_fields(exif)
+        removed_lines.append(
+            f"🗂 {n_fields} скрытых {plural(n_fields, 'поле', 'поля', 'полей')}"
+        )
+        if fmt_value("Model", exif.get("Model")):
+            removed_lines.insert(0, "📱 Данные камеры")
+        if isinstance(exif.get("GPSInfo"), dict) and gps_to_decimal(exif["GPSInfo"]):
+            removed_lines.insert(0, "📍 GPS-координаты")
+        clean_data, filename = strip_image(data)
+    elif kind == "pdf":
+        _, summary = analyze_pdf(data)
+        removed_lines.append(f"📕 Метаданные документа (~{summary['total']})")
+        clean_data, filename = clean_pdf(data)
+    elif kind == "audio":
+        removed_lines.append("🎧 Все аудио-теги")
+        clean_data, filename = clean_audio(data, name or "audio.mp3")
+    else:
+        raise ValueError("not cleanable")
+    return removed_lines, clean_data, filename
 
 
 async def handle_file(message: Message, bot: Bot) -> None:
@@ -666,72 +814,55 @@ async def handle_file(message: Message, bot: Bot) -> None:
     if message.photo:
         file_id = message.photo[-1].file_id
         source_name = None
-        compressed = True
+        is_photo = True
     else:
         doc = message.document
         file_id = doc.file_id
         source_name = doc.file_name
-        compressed = False
+        is_photo = False
 
     tg_file = await bot.get_file(file_id)
     buf = io.BytesIO()
     await bot.download_file(tg_file.file_path, destination=buf)
     data = buf.getvalue()
 
-    lower_name = (source_name or "").lower()
     mime = (message.document.mime_type if message.document else "") or ""
+    lower_name = (source_name or "").lower()
 
     prune_pending()
     key = secrets.token_urlsafe(16)
-    entry = {"ts": time.time(), "data": data, "name": source_name, "kind": "unknown"}
 
+    lp_disabled = LinkPreviewOptions(is_disabled=True)
     try:
-        if message.photo or mime.startswith("image/") or lower_name.endswith(IMAGE_EXTS) or compressed:
-            image = Image.open(io.BytesIO(data))
-            image.load()
-            entry["kind"] = "image"
-            report, summary, coords = build_report(image, len(data), source_name)
-            markup = build_markup(key, coords, summary["has_details"])
-            note = ""
-            if compressed:
-                note = "\n\n<i>⚠️ Telegram уже сжал это фото и стёр часть данных.\nОтправь файлом (📎) — увижу настоящий EXIF</i>"
-            bump_stat(user.id, "scanned")
-            if coords:
-                bump_stat(user.id, "gps_hits")
-            await status.edit_text(report + note, reply_markup=markup, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        elif mime == "application/pdf" or lower_name.endswith(".pdf"):
-            report, _ = analyze_pdf(data)
-            entry["kind"] = "pdf"
-            markup = build_markup(key, None, False, kind="pdf")
-            bump_stat(user.id, "scanned")
-            await status.edit_text(report, reply_markup=markup, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        elif lower_name.endswith(OFFICE_EXTS):
-            report = analyze_office(data, source_name or "document")
-            bump_stat(user.id, "scanned")
-            await status.edit_text(report + "\n\n<i>🧹 Очистка документов скоро…</i>", link_preview_options=LinkPreviewOptions(is_disabled=True))
-        elif mime.startswith("audio/") or lower_name.endswith(AUDIO_EXTS):
-            result = analyze_audio(data, source_name or "audio")
-            if result is None:
-                size_line = f"📄 <b>{esc(source_name)}</b>\n💾 {human_size(len(data))}\n🏷 MIME: {esc(mime or 'неизвестно')}"
-                await status.edit_text(size_line + "\n\n🤷 Не смог разобрать теги этого аудио.")
-                return
-            report, has_tags = result
-            entry["kind"] = "audio"
-            markup = build_markup(key, None, False, kind="audio")
-            bump_stat(user.id, "scanned")
-            await status.edit_text(report, reply_markup=markup, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        else:
-            size_line = f"📄 <b>{esc(source_name)}</b>\n💾 {human_size(len(data))}\n🏷 MIME: {esc(mime or 'неизвестно')}"
-            await status.edit_text(size_line + "\n\n🤷 Метаданные для этого типа я пока не читаю.\nПопробуй изображение, PDF, аудио или документ Office.")
-            return
-
-        pending[key] = entry
+        res = await asyncio.to_thread(analyze_sync, key, data, mime, lower_name, source_name, is_photo)
     except Exception:
         logging.exception("analyze failed")
-        await status.edit_text("😵 <b>Не смог прочитать этот файл</b>\n\nПришли изображение, PDF, аудио или документ Office.")
+        await status.edit_text(
+            "😵 <b>Не смог прочитать этот файл</b>\n\nПришли изображение, PDF, аудио или документ Office.",
+            link_preview_options=lp_disabled,
+        )
+        return
+
+    if res["unsupported"]:
+        size_line = f"📄 <b>{esc(source_name)}</b>\n💾 {human_size(len(data))}\n🏷 MIME: {esc(mime or 'неизвестно')}"
+        await status.edit_text(
+            size_line + "\n\n🤷 Метаданные для этого типа я пока не читаю.\nПопробуй изображение, PDF, аудио или документ Office.",
+            link_preview_options=lp_disabled,
+        )
+        return
+
+    bump_stat(user.id, "scanned")
+    if res["bump_gps"]:
+        bump_stat(user.id, "gps_hits")
+    if res["store"]:
+        pending[key] = {"ts": time.time(), "data": data, "name": source_name, "kind": res["kind"]}
+
+    if res["markup"] is not None:
+        await status.edit_text(res["text"], reply_markup=res["markup"], link_preview_options=lp_disabled)
+    else:
+        await status.edit_text(res["text"], link_preview_options=lp_disabled)
 
 
-@dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     user = message.from_user
     if is_banned(user.id):
@@ -741,18 +872,15 @@ async def cmd_start(message: Message) -> None:
     await message.answer(START_TEXT, reply_markup=main_menu_kb())
 
 
-@dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
 
 
-@dp.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
     scanned, cleaned, gps_hits, _ = get_user_row(message.from_user.id)
     await message.answer(stats_text(scanned, cleaned, gps_hits))
 
 
-@dp.message(Command("settings"))
 async def cmd_settings(message: Message) -> None:
     _, _, _, mode = get_user_row(message.from_user.id)
     await message.answer(settings_text(mode), reply_markup=settings_kb(mode))
@@ -938,13 +1066,11 @@ async def run_broadcast(bot: Bot, admin_id: int, src_chat: int, src_msg: int, bu
     )
 
 
-@dp.message(Command("cancel"), StateFilter("*"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("❌ Отменено.")
 
 
-@dp.message(Command("admin"), IsAdmin())
 async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     try:
@@ -957,7 +1083,6 @@ async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     await message.answer(ADMIN_HOME, reply_markup=admin_menu_kb())
 
 
-@dp.callback_query(F.data.startswith("adm:"), IsAdmin())
 async def on_admin(callback: CallbackQuery, state: FSMContext) -> None:
     action = callback.data.split(":", 1)[1]
     await callback.answer()
@@ -1005,7 +1130,6 @@ async def on_admin(callback: CallbackQuery, state: FSMContext) -> None:
         )
 
 
-@dp.message(Bans.add, F.text)
 async def bans_add(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     if not raw.isdigit():
@@ -1018,7 +1142,6 @@ async def bans_add(message: Message, state: FSMContext) -> None:
         await message.answer("👻 Такого юзера нет в базе. Пусть сначала напишет боту.")
 
 
-@dp.message(Bans.remove, F.text)
 async def bans_remove(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     if not raw.isdigit():
@@ -1064,7 +1187,6 @@ async def finish_confirm(target, state: FSMContext, buttons: list, edit: bool) -
         await target.answer(text, reply_markup=confirm_kb())
 
 
-@dp.message(Bcast.content)
 async def bcast_content(message: Message, state: FSMContext) -> None:
     if message.text and message.text.startswith("/"):
         await message.answer("⚠️ Сначала пришли контент рассылки или /cancel")
@@ -1095,13 +1217,11 @@ async def bcast_content(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.callback_query(F.data == "bc:nobtn", Bcast.buttons, IsAdmin())
 async def bc_nobtn(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await finish_confirm(callback.message, state, [], edit=True)
 
 
-@dp.message(Bcast.buttons, F.text)
 async def bcast_buttons(message: Message, state: FSMContext) -> None:
     if message.text.startswith("/"):
         await message.answer("⚠️ Пришли кнопки формата <code>Текст | https://ссылка</code>, нажми «Без кнопок» или /cancel")
@@ -1136,7 +1256,6 @@ async def bcast_buttons(message: Message, state: FSMContext) -> None:
     await finish_confirm(message, state, buttons, edit=False)
 
 
-@dp.callback_query(F.data == "bc:go", IsAdmin())
 async def bc_go(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     if "src_chat" not in data:
@@ -1149,7 +1268,6 @@ async def bc_go(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     asyncio.create_task(run_broadcast(bot, callback.from_user.id, src_chat, src_msg, buttons))
 
 
-@dp.callback_query(F.data == "bc:editbtn")
 async def bc_editbtn(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await callback.message.edit_text(
@@ -1158,19 +1276,16 @@ async def bc_editbtn(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(Bcast.buttons)
 
 
-@dp.callback_query(F.data == "bc:cancel")
 async def bc_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer("Отменено")
     await callback.message.edit_text(ADMIN_HOME, reply_markup=admin_menu_kb())
 
 
-@dp.message(F.photo)
 async def on_photo(message: Message, bot: Bot) -> None:
     await handle_file(message, bot)
 
 
-@dp.message(F.document)
 async def on_document(message: Message, bot: Bot) -> None:
     await handle_file(message, bot)
 
@@ -1215,7 +1330,6 @@ def settings_kb(mode: int) -> InlineKeyboardMarkup:
     )
 
 
-@dp.callback_query(F.data.startswith("mode:"))
 async def on_mode(callback: CallbackQuery) -> None:
     mode = 1 if callback.data.endswith("doc") else 0
     set_send_mode(callback.from_user.id, mode)
@@ -1223,7 +1337,6 @@ async def on_mode(callback: CallbackQuery) -> None:
     await callback.message.edit_text(settings_text(mode), reply_markup=settings_kb(mode))
 
 
-@dp.callback_query(F.data.startswith("menu:"))
 async def on_menu(callback: CallbackQuery) -> None:
     action = callback.data.split(":", 1)[1]
     await callback.answer()
@@ -1243,7 +1356,6 @@ async def on_menu(callback: CallbackQuery) -> None:
         await callback.message.edit_text(settings_text(mode), reply_markup=settings_kb(mode))
 
 
-@dp.callback_query(F.data.startswith("clean:"))
 async def on_clean(callback: CallbackQuery, bot: Bot) -> None:
     key = callback.data.split(":", 1)[1]
     entry = pending.pop(key, None)
@@ -1259,33 +1371,18 @@ async def on_clean(callback: CallbackQuery, bot: Bot) -> None:
     name = entry["name"]
 
     try:
-        removed_lines = []
-        if kind == "image":
-            exif = get_exif(Image.open(io.BytesIO(data)))
-            removed_lines.append(f"▫️ {count_fields(exif)} скрытых полей")
-            if fmt_value("Model", exif.get("Model")):
-                removed_lines.insert(0, "▫️ данные камеры 📱")
-            if isinstance(exif.get("GPSInfo"), dict) and gps_to_decimal(exif["GPSInfo"]):
-                removed_lines.insert(0, "▫️ GPS-координаты 📍")
-            clean_data, filename = strip_image(data)
-        elif kind == "pdf":
-            report, summary = analyze_pdf(data)
-            removed_lines.append(f"▫️ ~{summary['total']} метаполей")
-            clean_data, filename = clean_pdf(data)
-        elif kind == "audio":
-            removed_lines.append("▫️ все аудио-теги 🎧")
-            clean_data, filename = clean_audio(data, name or "audio.mp3")
-        else:
-            raise ValueError("not cleanable")
+        removed_lines, clean_data, filename = await asyncio.to_thread(clean_sync, kind, data, name)
     except Exception:
         logging.exception("clean failed")
         await stage.edit_text("💥 <b>Что-то пошло не так</b>\n\nПопробуй другой формат файла")
         return
 
-    checklist = "\n".join(removed_lines[:4])
+    removed_shown = [f"✔ {esc(line)}" for line in removed_lines[:4]]
+    if len(removed_lines) > 4:
+        removed_shown.append(f"… и ещё {len(removed_lines) - 4}")
     caption = (
-        "✅ <b>Файл очищен!</b>\n\n"
-        f"<blockquote>Стерто:\n{esc(checklist)}</blockquote>\n"
+        "✨ <b>Файл очищен!</b>\n\n"
+        f"<blockquote><b>Стерто:</b>\n" + "\n".join(removed_shown) + "</blockquote>\n"
         "Теперь он ничего о тебе не расскажет 🔒"
     )
 
@@ -1302,29 +1399,32 @@ async def on_clean(callback: CallbackQuery, bot: Bot) -> None:
         pass
 
 
-@dp.callback_query(F.data.startswith("all:"))
 async def on_all(callback: CallbackQuery) -> None:
     key = callback.data.split(":", 1)[1]
     entry = pending.get(key)
     if entry is None:
         await callback.answer("⌛ Данные устарели — отправь файл заново", show_alert=True)
         return
-    try:
-        details = build_details(get_exif(Image.open(io.BytesIO(entry["data"]))))
-    except Exception:
-        details = None
+
+    def extract_details() -> str | None:
+        try:
+            return build_details(get_exif(Image.open(io.BytesIO(entry["data"]))))
+        except Exception:
+            return None
+
+    details = await asyncio.to_thread(extract_details)
     if not details:
         await callback.answer("Дополнительных полей нет", show_alert=True)
         return
     await callback.answer()
     await callback.message.answer(
         "📖 <b>Полный дамп метаданных</b>\n"
-        f"<pre>{details}</pre>",
+        "<i>Нажми, чтобы раскрыть 👇</i>\n"
+        f"<blockquote expandable><pre>{details}</pre></blockquote>",
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
 
-@dp.message()
 async def on_unknown(message: Message) -> None:
     await message.answer(
         "🤔 Не понимаю.\n\nПришли фото или файл (📎) для сканирования,\nили открой меню через /start"
@@ -1374,16 +1474,64 @@ async def setup_profile(bot: Bot) -> None:
         logging.exception("profile setup failed")
 
 
+def register_handlers(dp: Dispatcher) -> None:
+    dp.message(CommandStart())(cmd_start)
+    dp.message(Command("help"))(cmd_help)
+    dp.message(Command("stats"))(cmd_stats)
+    dp.message(Command("settings"))(cmd_settings)
+    dp.message(Command("cancel"), StateFilter("*"))(cmd_cancel)
+    dp.message(Command("admin"), IsAdmin())(cmd_admin)
+    dp.callback_query(F.data.startswith("adm:"), IsAdmin())(on_admin)
+    dp.message(Bans.add, F.text)(bans_add)
+    dp.message(Bans.remove, F.text)(bans_remove)
+    dp.message(Bcast.content)(bcast_content)
+    dp.callback_query(F.data == "bc:nobtn", Bcast.buttons, IsAdmin())(bc_nobtn)
+    dp.message(Bcast.buttons, F.text)(bcast_buttons)
+    dp.callback_query(F.data == "bc:go", IsAdmin())(bc_go)
+    dp.callback_query(F.data == "bc:editbtn")(bc_editbtn)
+    dp.callback_query(F.data == "bc:cancel")(bc_cancel)
+    dp.message(F.photo)(on_photo)
+    dp.message(F.document)(on_document)
+    dp.callback_query(F.data.startswith("mode:"))(on_mode)
+    dp.callback_query(F.data.startswith("menu:"))(on_menu)
+    dp.callback_query(F.data.startswith("clean:"))(on_clean)
+    dp.callback_query(F.data.startswith("all:"))(on_all)
+    dp.message()(on_unknown)
+
+
+async def run_bot(token: str) -> None:
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    register_handlers(dp)
+    try:
+        me = await bot.get_me()
+        await bot.delete_webhook(drop_pending_updates=True)
+        await setup_profile(bot)
+        logging.info("bot @%s polling started", me.username)
+        await dp.start_polling(bot)
+    except Exception:
+        logging.exception("bot crashed")
+    finally:
+        await bot.session.close()
+
+
 async def main() -> None:
     os.makedirs(DB_DIR, exist_ok=True)
     load_admins()
     with db_connect():
         pass
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await bot.delete_webhook(drop_pending_updates=True)
-    await setup_profile(bot)
-    await dp.start_polling(bot)
+    if not TOKENS:
+        raise SystemExit("No tokens: set BOT_TOKEN or BOT_TOKENS env variable")
+    logging.info("starting %d bot(s)", len(TOKENS))
+    results = await asyncio.gather(*(run_bot(t) for t in TOKENS), return_exceptions=True)
+    failures = [r for r in results if isinstance(r, BaseException)]
+    if failures:
+        logging.error("%d bot(s) exited with error", len(failures))
+    logging.info("all bots stopped")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
