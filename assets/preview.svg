@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="360" font-family="monospace">
+  <rect width="860" height="360" rx="16" fill="#1a1b26"/>
+  <text x="430" y="36" text-anchor="middle" font-size="20" fill="#2ca5e0">🔍 KudexMeta</text>
+  <text x="430" y="58" text-anchor="middle" font-size="12" fill="#565f89">файл → память (не диск) → метаданные → риск → чистая копия</text>
+  <g font-size="13">
+    <rect x="25" y="86" width="150" height="80" rx="10" fill="#24283b" stroke="#2ca5e0" stroke-width="2"/>
+    <text x="100" y="114" text-anchor="middle" fill="#2ca5e0">📎 файл</text>
+    <text x="100" y="136" text-anchor="middle" fill="#565f89">фото · PDF</text>
+    <text x="100" y="154" text-anchor="middle" fill="#565f89">аудио · Office</text>
+    <rect x="195" y="86" width="150" height="80" rx="10" fill="#24283b" stroke="#9ece6a" stroke-width="2"/>
+    <text x="270" y="114" text-anchor="middle" fill="#9ece6a">🧠 RAM only</text>
+    <text x="270" y="136" text-anchor="middle" fill="#565f89">на диск — ничего</text>
+    <text x="270" y="154" text-anchor="middle" fill="#565f89">лимит 256МБ</text>
+    <rect x="365" y="86" width="150" height="80" rx="10" fill="#24283b" stroke="#e0af68" stroke-width="2"/>
+    <text x="440" y="114" text-anchor="middle" fill="#e0af68">🔎 разбор</text>
+    <text x="440" y="136" text-anchor="middle" fill="#565f89">Pillow · pypdf</text>
+    <text x="440" y="154" text-anchor="middle" fill="#565f89">mutagen · в потоке</text>
+    <rect x="535" y="86" width="140" height="80" rx="10" fill="#24283b" stroke="#f7768e" stroke-width="2"/>
+    <text x="605" y="114" text-anchor="middle" fill="#f7768e">🚦 риск</text>
+    <text x="605" y="136" text-anchor="middle" fill="#565f89">ЧИСТО … GPS =</text>
+    <text x="605" y="154" text-anchor="middle" fill="#565f89">КРИТИЧЕСКИЙ 🔴</text>
+    <rect x="695" y="86" width="140" height="80" rx="10" fill="#9ece6a"/>
+    <text x="765" y="114" text-anchor="middle" fill="#1a1b26">🧹 очистить</text>
+    <text x="765" y="136" text-anchor="middle" fill="#1a1b26">файл с нуля</text>
+    <text x="765" y="154" text-anchor="middle" fill="#1a1b26">без EXIF · GPS</text>
+  </g>
+  <g stroke="#565f89" stroke-width="2">
+    <line x1="175" y1="126" x2="195" y2="126"/>
+    <line x1="345" y1="126" x2="365" y2="126"/>
+    <line x1="515" y1="126" x2="535" y2="126"/>
+    <line x1="675" y1="126" x2="695" y2="126"/>
+  </g>
+  <g font-size="12" text-anchor="middle">
+    <rect x="40" y="196" width="170" height="44" rx="22" fill="#24283b" stroke="#2ca5e0" stroke-width="2"/>
+    <text x="125" y="223" fill="#c0caf5">🖼 EXIF + GPS</text>
+    <rect x="225" y="196" width="170" height="44" rx="22" fill="#24283b" stroke="#2ca5e0" stroke-width="2"/>
+    <text x="310" y="223" fill="#c0caf5">📕 PDF автор</text>
+    <rect x="410" y="196" width="170" height="44" rx="22" fill="#24283b" stroke="#2ca5e0" stroke-width="2"/>
+    <text x="495" y="223" fill="#c0caf5">🎧 аудио-теги</text>
+    <rect x="595" y="196" width="225" height="44" rx="22" fill="#24283b" stroke="#2ca5e0" stroke-width="2"/>
+    <text x="707" y="223" fill="#c0caf5">📘 Office автор</text>
+  </g>
+  <text x="430" y="272" text-anchor="middle" font-size="12" fill="#565f89">ранги от 🐣 до 👻 · статистика · настройки · админка с рассылкой 📢</text>
+  <text x="430" y="296" text-anchor="middle" font-size="12" fill="#565f89">мультибот: BOT_TOKENS — сколько угодно ботов в одном процессе 🤖🤖🤖</text>
+  <text x="430" y="320" text-anchor="middle" font-size="12" fill="#565f89">слабый VPS: SQLite WAL · тяжёлое вне event loop · OOM исключён</text>
+</svg>

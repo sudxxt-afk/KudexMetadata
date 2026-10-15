@@ -1,8 +1,17 @@
 # 🔍 KudexMeta
 
+![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=flat-square&logo=python)
+![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?style=flat-square&logo=telegram)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker)
+![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?style=flat-square)
+![License](https://img.shields.io/badge/License-MIT-9ece6a?style=flat-square)
+![Privacy](https://img.shields.io/badge/На_диск-ничего-f7768e?style=flat-square)
+
 Telegram-бот, который показывает **все скрытые метаданные** твоих файлов — и стирает их одной кнопкой.
 
 > Каждое фото рассказывает о тебе больше, чем ты думаешь: где снято, на что, когда и чем обработано.
+
+![Как это работает](assets/preview.svg)
 
 ## ✨ Возможности
 
